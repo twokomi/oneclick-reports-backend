@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pydantic
+httpx
+python-dotenv
+openai>=1.40.0
+reportlab
+notion-client
+feedparser
