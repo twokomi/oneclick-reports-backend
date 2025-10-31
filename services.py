@@ -1,4 +1,5 @@
 import os, datetime as dt, math
+from datetime import timedelta
 import httpx
 import feedparser
 from openai import OpenAI
@@ -12,7 +13,7 @@ FRED_KEY = os.getenv("FRED_KEY")
 async def fetch_rss_news(kind: str) -> list[dict]:
     """
     RSS 피드에서 최신 뉴스를 수집합니다.
-    Fallback: 네트워크 실패 시 stub 데이터 반환
+    ⚠️ STUB 제거: 실패시 빈 배열 반환
     """
     news_sources = []
     
@@ -63,21 +64,19 @@ async def fetch_rss_news(kind: str) -> list[dict]:
     except Exception as e:
         print(f"Google News RSS 오류: {e}")
     
-    # Fallback: stub 데이터
+    # ⚠️ STUB 제거: 실패시 빈 배열 반환
     if not news_sources:
-        print("모든 RSS 피드 실패 - stub 데이터 사용")
-        return [
-            {"title": "[스텁] 한국 CPI 3.2% 기록, 예상치 상회", "url": "https://example.com/kcpi", "source": "stub", "date": dt.datetime.now().isoformat()},
-            {"title": "[스텁] 코스피 외국인 순매도 지속", "url": "https://example.com/kospi", "source": "stub", "date": dt.datetime.now().isoformat()},
-            {"title": "[스텁] 미 연준 금리 동결 결정", "url": "https://example.com/fed", "source": "stub", "date": dt.datetime.now().isoformat()},
-            {"title": "[스텁] 서울 아파트 매매가 6주 연속 상승", "url": "https://example.com/apt", "source": "stub", "date": dt.datetime.now().isoformat()},
-        ]
+        print("⚠️ 모든 RSS 피드 실패 - 빈 배열 반환")
+        return []
     
     return news_sources[:10]  # 최대 10개 반환
 
 # ---------------- FRED helpers ----------------
 async def fred_latest(series_id: str):
-    if not FRED_KEY: return None
+    """FRED API에서 최신 값 조회"""
+    if not FRED_KEY: 
+        print(f"⚠️ FRED_KEY 없음 - {series_id} 조회 불가")
+        return None
     url = f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={FRED_KEY}&file_type=json&sort_order=desc&limit=1"
     try:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -92,25 +91,101 @@ async def fred_latest(series_id: str):
         print(f"FRED API 오류 ({series_id}): {e}")
         return None
 
+async def fred_historical(series_id: str, days: int = 30):
+    """
+    FRED API에서 히스토리컬 데이터 조회
+    - days: 최근 며칠간의 데이터 (기본 30일)
+    - 반환: [{"date": "YYYY-MM-DD", "value": float}, ...]
+    """
+    if not FRED_KEY:
+        print(f"⚠️ FRED_KEY 없음 - {series_id} 히스토리컬 조회 불가")
+        return []
+    
+    end_date = dt.datetime.now().date()
+    start_date = end_date - timedelta(days=days)
+    
+    url = (
+        f"https://api.stlouisfed.org/fred/series/observations"
+        f"?series_id={series_id}"
+        f"&api_key={FRED_KEY}"
+        f"&file_type=json"
+        f"&observation_start={start_date.isoformat()}"
+        f"&observation_end={end_date.isoformat()}"
+        f"&sort_order=asc"
+    )
+    
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            j = r.json()
+        
+        observations = j.get("observations", [])
+        result = []
+        for obs in observations:
+            value = obs.get("value")
+            date = obs.get("date")
+            # "." 값 필터링 (FRED에서 데이터 없음을 의미)
+            if value and value != "." and date:
+                try:
+                    result.append({"date": date, "value": float(value)})
+                except ValueError:
+                    continue
+        
+        return result
+    except Exception as e:
+        print(f"FRED 히스토리컬 API 오류 ({series_id}): {e}")
+        return []
+
 async def enrich_with_fred(data: dict) -> dict:
+    """실제 FRED 데이터로 보강 (스텁 없음)"""
+    
+    # 미국 10년물 국채 금리
     dgs10 = await fred_latest("DGS10")
     if dgs10 and dgs10["value"] not in (None, "."):
         data.setdefault("daily_snapshot", {}).setdefault("rates", {})["UST10Y"] = float(dgs10["value"])
+    
+    # 원/달러 환율
     krw = await fred_latest("DEXKOUS")
     if krw and krw["value"] not in (None, "."):
         data.setdefault("daily_snapshot", {}).setdefault("fx", {})["USDKRW"] = float(krw["value"])
+    
+    # 미국 CPI
     cpi = await fred_latest("CPIAUCSL")
     if cpi and cpi["value"] not in (None, "."):
-        data.setdefault("macro", []).append({"name":"US CPI (index)", "latest": float(cpi["value"]), "note": cpi["date"]})
+        data.setdefault("macro", []).append({
+            "name": "US CPI (index)", 
+            "latest": float(cpi["value"]), 
+            "note": cpi["date"]
+        })
+    
+    # 미국 실업률
     unrate = await fred_latest("UNRATE")
     if unrate and unrate["value"] not in (None, "."):
-        data.setdefault("macro", []).append({"name":"US Unemployment Rate", "latest": float(unrate["value"]), "note": unrate["date"]})
+        data.setdefault("macro", []).append({
+            "name": "US Unemployment Rate", 
+            "latest": float(unrate["value"]), 
+            "note": unrate["date"]
+        })
+    
+    # 미국 연준 기준금리
     ffr = await fred_latest("FEDFUNDS")
     if ffr and ffr["value"] not in (None, "."):
-        data.setdefault("macro", []).append({"name":"Fed Funds Rate", "latest": float(ffr["value"]), "note": ffr["date"]})
+        data.setdefault("macro", []).append({
+            "name": "Fed Funds Rate", 
+            "latest": float(ffr["value"]), 
+            "note": ffr["date"]
+        })
+    
+    # 한국 CPI (OECD/FRED)
     korcpi = await fred_latest("KORCPIALLMINMEI")
     if korcpi and korcpi["value"] not in (None, "."):
-        data.setdefault("macro", []).append({"name":"Korea CPI (OECD/FRED)", "latest": float(korcpi["value"]), "note": korcpi["date"]})
+        data.setdefault("macro", []).append({
+            "name": "Korea CPI (OECD/FRED)", 
+            "latest": float(korcpi["value"]), 
+            "note": korcpi["date"]
+        })
+    
     return data
 
 # ---------------- ECOS(옵션) ----------------
@@ -131,30 +206,36 @@ async def ecos_korea_cpi_latest():
 async def enrich_with_ecos(data: dict) -> dict:
     kcpi = await ecos_korea_cpi_latest()
     if kcpi:
-        data.setdefault("macro", []).append({"name":"Korea CPI (ECOS)", "latest": kcpi["value"], "note": kcpi["date"]})
+        data.setdefault("macro", []).append({
+            "name": "Korea CPI (ECOS)", 
+            "latest": kcpi["value"], 
+            "note": kcpi["date"]
+        })
     return data
 
 # ---------------- 입력 데이터 구성 ----------------
 async def build_inputs(kind: str) -> dict:
+    """
+    ⚠️ STUB 제거: 실제 데이터만 수집
+    - 시장 스냅샷: FRED 실데이터만 포함 (stub indices 제거)
+    - 뉴스: RSS 실패시 빈 배열
+    - 매크로: FRED/ECOS 실데이터만
+    """
     today = dt.datetime.now().date().isoformat()
     
-    # RSS 뉴스 수집
+    # RSS 뉴스 수집 (stub 없음)
     headlines = await fetch_rss_news(kind)
     
+    # ⚠️ STUB 제거: 기본 구조만 생성 (실데이터로만 채움)
     data = {
         "date": today,
-        "daily_snapshot": {
-            "indices": {"KOSPI": 2640.0, "KOSDAQ": 850.0, "S&P500": 5350.0, "Nasdaq": 17000.0, "Dow": 39000.0},
-            "fx": {"USDKRW": 1390.0},
-            "rates": {"UST10Y": 4.4, "KR3Y": 3.5},
-            "commodities": {"WTI": 78.5, "Brent": 82.0, "Gold": 2350.0}
-        },
-        "macro": [
-            {"name": "Korea CPI (stub)", "latest": 3.2, "prev": 3.0, "consensus": 3.1, "yoy": 3.2},
-            {"name": "US CPI (stub)", "latest": 3.4, "consensus": 3.4, "core": 3.8}
-        ],
+        "daily_snapshot": {},  # FRED에서만 채움
+        "macro": [],           # FRED/ECOS에서만 채움
         "headlines": headlines,
-        "user_profile": {"risk_pref": "중립", "interests": ["반도체", "부동산"]}
+        "user_profile": {
+            "risk_pref": "중립", 
+            "interests": ["반도체", "부동산"]
+        }
     }
     
     # 실데이터 보강
@@ -167,16 +248,9 @@ async def build_inputs(kind: str) -> dict:
 async def call_llm(system_prompt: str, user_prompt: str) -> str:
     if not OPENAI:
         return (
-            "**요약**: (스텁) 물가 둔화 기대와 정책 불확실성 혼재.\n\n"
-            "**핵심 데이터**\n\n"
-            "|지표|수치|전월/전년|컨센서스|코멘트|\n"
-            "|---|---:|---:|---:|---|\n"
-            "|Korea CPI|3.2%|+0.2%p|3.1%|식료·에너지 영향|\n"
-            "|US CPI|3.4%|-|3.4%|근원 높은 편|\n\n"
-            "**해석**: (스텁) 긴축 장기화 리스크.\n\n"
-            "**시장 반응**: (스텁) 나스닥 약세, 원/달러 강세.\n\n"
-            "**리스크 Top3**: (1) 인플레 재가속 (2) 달러 강세 (3) 지정학.\n\n"
-            "**맞춤 코멘트**: 반도체 단기 변동성 주의, 주택은 금리 피크아웃 확인후 접근."
+            "**⚠️ OpenAI API 키가 설정되지 않았습니다.**\n\n"
+            "환경변수 `OPENAI_API_KEY`를 설정해주세요.\n\n"
+            "분석 리포트를 생성하려면 OpenAI API가 필요합니다."
         )
     
     try:
@@ -204,11 +278,15 @@ def build_analysis_prompt(data: dict) -> tuple[str, str]:
     
     # 뉴스 헤드라인 포맷팅
     news_section = "\n\n### 📰 오늘의 주요 뉴스 (RSS 기반)\n\n"
-    for idx, headline in enumerate(data.get("headlines", []), 1):
-        news_section += f"[{idx}] **{headline.get('title')}**\n"
-        news_section += f"   - 출처: {headline.get('source')}\n"
-        news_section += f"   - 링크: {headline.get('url')}\n"
-        news_section += f"   - 날짜: {headline.get('date', 'N/A')}\n\n"
+    headlines = data.get("headlines", [])
+    if headlines:
+        for idx, headline in enumerate(headlines, 1):
+            news_section += f"[{idx}] **{headline.get('title')}**\n"
+            news_section += f"   - 출처: {headline.get('source')}\n"
+            news_section += f"   - 링크: {headline.get('url')}\n"
+            news_section += f"   - 날짜: {headline.get('date', 'N/A')}\n\n"
+    else:
+        news_section += "⚠️ RSS 뉴스 수집 실패 (네트워크 오류)\n\n"
     
     user = f"""
 아래 JSON과 RSS 뉴스 링크로 리포트를 작성:

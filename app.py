@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import os, datetime as dt
 from pathlib import Path
 from storage import save_report, list_reports
-from services import build_inputs, build_analysis_prompt, call_llm
+from services import build_inputs, build_analysis_prompt, call_llm, fred_historical
 from notion_client import Client as NotionClient
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
@@ -131,6 +131,15 @@ def format_data_report(data: dict, kind: str) -> str:
             if date:
                 lines.append(f"- **날짜**: {date}")
             lines.append("")
+    else:
+        lines.extend([
+            "---",
+            "",
+            "## 📰 최신 뉴스 헤드라인",
+            "",
+            "⚠️ RSS 뉴스를 가져올 수 없습니다 (네트워크 오류).",
+            ""
+        ])
     
     # 4. 사용자 프로필
     profile = data.get("user_profile", {})
@@ -151,9 +160,9 @@ def format_data_report(data: dict, kind: str) -> str:
         "",
         "## ℹ️ 데이터 소스",
         "",
-        "- **시장 데이터**: 실시간 스냅샷 (일부 stub 포함)",
-        "- **경제 지표**: FRED API (실제 데이터)",
+        "- **경제 지표**: FRED API (실제 데이터만 사용)",
         "- **뉴스**: RSS 피드 (연합뉴스, 한국경제, Google News)",
+        "- **⚠️ 스텁 데이터 제거됨**: 실제 데이터만 표시",
         "",
         "---",
         "",
@@ -219,6 +228,78 @@ def get_report_by_id(rid: int):
         if it["id"] == rid:
             return it
     raise HTTPException(status_code=404, detail="report not found")
+
+# 🆕 트렌드 데이터 API 엔드포인트
+@app.get("/trends/{series_id}")
+async def get_trend_data(series_id: str, days: int = 30):
+    """
+    FRED 시계열 데이터의 트렌드 조회
+    
+    Parameters:
+    - series_id: FRED 시리즈 ID (예: DGS10, DEXKOUS, CPIAUCSL, UNRATE, FEDFUNDS)
+    - days: 조회할 기간 (기본 30일)
+    
+    Returns:
+    - data: [{"date": "YYYY-MM-DD", "value": float}, ...]
+    - series_id: 조회한 시리즈 ID
+    - count: 데이터 포인트 개수
+    """
+    if days < 1 or days > 365:
+        raise HTTPException(status_code=400, detail="days must be between 1 and 365")
+    
+    try:
+        trend_data = await fred_historical(series_id, days)
+        
+        if not trend_data:
+            return {
+                "series_id": series_id,
+                "data": [],
+                "count": 0,
+                "message": "No data available for this series"
+            }
+        
+        return {
+            "series_id": series_id,
+            "data": trend_data,
+            "count": len(trend_data),
+            "period_days": days
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch trend data: {str(e)}")
+
+# 🆕 여러 시리즈 일괄 조회 API
+@app.post("/trends/batch")
+async def get_batch_trends(series_ids: list[str], days: int = 30):
+    """
+    여러 FRED 시계열 데이터를 한 번에 조회
+    
+    Request Body:
+    - series_ids: ["DGS10", "DEXKOUS", ...]
+    - days: 조회할 기간 (기본 30일)
+    
+    Returns:
+    - trends: {"DGS10": [...], "DEXKOUS": [...], ...}
+    """
+    if days < 1 or days > 365:
+        raise HTTPException(status_code=400, detail="days must be between 1 and 365")
+    
+    if len(series_ids) > 10:
+        raise HTTPException(status_code=400, detail="Maximum 10 series allowed per request")
+    
+    results = {}
+    for series_id in series_ids:
+        try:
+            trend_data = await fred_historical(series_id, days)
+            results[series_id] = trend_data
+        except Exception as e:
+            print(f"Error fetching {series_id}: {e}")
+            results[series_id] = []
+    
+    return {
+        "trends": results,
+        "period_days": days,
+        "requested_series": series_ids
+    }
 
 @app.get("/report/{rid}/export")
 def export_report(rid: int, fmt: str = "md"):
