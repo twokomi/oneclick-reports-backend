@@ -8,14 +8,31 @@ OPENAI = os.getenv("OPENAI_API_KEY")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 ECOS_KEY = os.getenv("ECOS_KEY")
 FRED_KEY = os.getenv("FRED_KEY")
+ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY")  # 🆕 Alpha Vantage API 키
 
-# ---------------- Yahoo Finance 주식 데이터 (무료) ----------------
-async def fetch_yahoo_quote(symbol: str):
+# ---------------- Alpha Vantage 주식 데이터 (무료, 25회/일) ----------------
+async def fetch_alpha_vantage_quote(symbol: str):
     """
-    Yahoo Finance에서 실시간 주가 조회
-    - symbol: 주식 심볼 (예: ^KS11, ^KQ11, ^GSPC, ^IXIC, ^DJI)
+    Alpha Vantage에서 실시간 주가 조회
+    - symbol: 주식 심볼 (예: 005930.KS, AAPL, ^GSPC)
     """
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    if not ALPHA_VANTAGE_KEY:
+        print(f"⚠️ ALPHA_VANTAGE_KEY 없음 - {symbol} 조회 불가")
+        return None
+    
+    # Alpha Vantage는 .KS 같은 suffix를 지원하지 않음
+    # 한국 주식은 KOSPI.INDX 형태 사용
+    symbol_map = {
+        "KOSPI": "KOSPI.INDX",
+        "KOSDAQ": "KOSDAQ.INDX", 
+        "S&P500": "SPX",
+        "Nasdaq": "IXIC",
+        "Dow": "DJI"
+    }
+    
+    av_symbol = symbol_map.get(symbol, symbol)
+    
+    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={av_symbol}&apikey={ALPHA_VANTAGE_KEY}"
     
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -23,44 +40,43 @@ async def fetch_yahoo_quote(symbol: str):
             r.raise_for_status()
             data = r.json()
         
-        result = data.get("chart", {}).get("result", [])
-        if not result:
-            return None
+        quote = data.get("Global Quote", {})
+        price = quote.get("05. price")
         
-        meta = result[0].get("meta", {})
-        current_price = meta.get("regularMarketPrice")
-        
-        if current_price:
+        if price:
             return {
                 "symbol": symbol,
-                "price": current_price,
-                "currency": meta.get("currency", "USD"),
-                "timestamp": meta.get("regularMarketTime")
+                "price": float(price),
+                "change": quote.get("09. change"),
+                "change_percent": quote.get("10. change percent")
             }
+        
+        # API 제한 확인
+        if "Note" in data:
+            print(f"⚠️ Alpha Vantage API 제한: {data['Note']}")
+        
         return None
     except Exception as e:
-        print(f"Yahoo Finance 오류 ({symbol}): {e}")
+        print(f"Alpha Vantage 오류 ({symbol}): {e}")
         return None
 
 async def fetch_market_indices():
     """
-    주요 시장 지수 실시간 조회
+    주요 시장 지수 실시간 조회 (Alpha Vantage)
     """
-    symbols = {
-        "KOSPI": "^KS11",      # 한국 코스피
-        "KOSDAQ": "^KQ11",     # 한국 코스닥
-        "S&P500": "^GSPC",     # 미국 S&P 500
-        "Nasdaq": "^IXIC",     # 미국 나스닥
-        "Dow": "^DJI"          # 미국 다우존스
-    }
+    # Alpha Vantage는 하루 25회 제한이므로 꼭 필요한 것만 조회
+    indices_to_fetch = ["KOSPI", "KOSDAQ", "S&P500", "Nasdaq"]
     
     indices = {}
-    for name, symbol in symbols.items():
-        quote = await fetch_yahoo_quote(symbol)
+    for symbol in indices_to_fetch:
+        quote = await fetch_alpha_vantage_quote(symbol)
         if quote:
-            indices[name] = round(quote["price"], 2)
+            indices[symbol] = round(quote["price"], 2)
         else:
-            print(f"⚠️ {name} 데이터 없음")
+            print(f"⚠️ {symbol} 데이터 없음")
+        
+        # API 제한 방지를 위해 약간의 딜레이
+        await asyncio.sleep(0.5)
     
     return indices
 
@@ -272,20 +288,26 @@ async def enrich_with_ecos(data: dict) -> dict:
 async def build_inputs(kind: str) -> dict:
     """
     ⚠️ STUB 제거: 실제 데이터만 수집
-    🆕 Yahoo Finance로 주식 데이터 수집
+    🆕 Alpha Vantage로 주식 데이터 수집
     """
+    import asyncio  # asyncio.sleep 사용을 위해 import
+    
     today = dt.datetime.now().date().isoformat()
     
     # RSS 뉴스 수집 (stub 없음)
     headlines = await fetch_rss_news(kind)
     
-    # 🆕 Yahoo Finance로 주식 지수 수집
-    market_indices = await fetch_market_indices()
+    # 🆕 Alpha Vantage로 주식 지수 수집
+    market_indices = {}
+    if ALPHA_VANTAGE_KEY:
+        market_indices = await fetch_market_indices()
+    else:
+        print("⚠️ ALPHA_VANTAGE_KEY 없음 - 주식 데이터 스킵")
     
     # ⚠️ STUB 제거: 기본 구조만 생성 (실데이터로만 채움)
     data = {
         "date": today,
-        "daily_snapshot": {},  # FRED + Yahoo Finance에서 채움
+        "daily_snapshot": {},  # FRED + Alpha Vantage에서 채움
         "macro": [],           # FRED/ECOS에서만 채움
         "headlines": headlines,
         "user_profile": {
@@ -294,7 +316,7 @@ async def build_inputs(kind: str) -> dict:
         }
     }
     
-    # 🆕 Yahoo Finance 주식 지수 추가
+    # 🆕 Alpha Vantage 주식 지수 추가
     if market_indices:
         data["daily_snapshot"]["indices"] = market_indices
     
