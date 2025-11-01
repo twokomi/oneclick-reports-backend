@@ -9,6 +9,61 @@ CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 ECOS_KEY = os.getenv("ECOS_KEY")
 FRED_KEY = os.getenv("FRED_KEY")
 
+# ---------------- Yahoo Finance 주식 데이터 (무료) ----------------
+async def fetch_yahoo_quote(symbol: str):
+    """
+    Yahoo Finance에서 실시간 주가 조회
+    - symbol: 주식 심볼 (예: ^KS11, ^KQ11, ^GSPC, ^IXIC, ^DJI)
+    """
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            data = r.json()
+        
+        result = data.get("chart", {}).get("result", [])
+        if not result:
+            return None
+        
+        meta = result[0].get("meta", {})
+        current_price = meta.get("regularMarketPrice")
+        
+        if current_price:
+            return {
+                "symbol": symbol,
+                "price": current_price,
+                "currency": meta.get("currency", "USD"),
+                "timestamp": meta.get("regularMarketTime")
+            }
+        return None
+    except Exception as e:
+        print(f"Yahoo Finance 오류 ({symbol}): {e}")
+        return None
+
+async def fetch_market_indices():
+    """
+    주요 시장 지수 실시간 조회
+    """
+    symbols = {
+        "KOSPI": "^KS11",      # 한국 코스피
+        "KOSDAQ": "^KQ11",     # 한국 코스닥
+        "S&P500": "^GSPC",     # 미국 S&P 500
+        "Nasdaq": "^IXIC",     # 미국 나스닥
+        "Dow": "^DJI"          # 미국 다우존스
+    }
+    
+    indices = {}
+    for name, symbol in symbols.items():
+        quote = await fetch_yahoo_quote(symbol)
+        if quote:
+            indices[name] = round(quote["price"], 2)
+        else:
+            print(f"⚠️ {name} 데이터 없음")
+    
+    return indices
+
 # ---------------- RSS 뉴스 수집 (무료) ----------------
 async def fetch_rss_news(kind: str) -> list[dict]:
     """
@@ -217,19 +272,20 @@ async def enrich_with_ecos(data: dict) -> dict:
 async def build_inputs(kind: str) -> dict:
     """
     ⚠️ STUB 제거: 실제 데이터만 수집
-    - 시장 스냅샷: FRED 실데이터만 포함 (stub indices 제거)
-    - 뉴스: RSS 실패시 빈 배열
-    - 매크로: FRED/ECOS 실데이터만
+    🆕 Yahoo Finance로 주식 데이터 수집
     """
     today = dt.datetime.now().date().isoformat()
     
     # RSS 뉴스 수집 (stub 없음)
     headlines = await fetch_rss_news(kind)
     
+    # 🆕 Yahoo Finance로 주식 지수 수집
+    market_indices = await fetch_market_indices()
+    
     # ⚠️ STUB 제거: 기본 구조만 생성 (실데이터로만 채움)
     data = {
         "date": today,
-        "daily_snapshot": {},  # FRED에서만 채움
+        "daily_snapshot": {},  # FRED + Yahoo Finance에서 채움
         "macro": [],           # FRED/ECOS에서만 채움
         "headlines": headlines,
         "user_profile": {
@@ -238,7 +294,11 @@ async def build_inputs(kind: str) -> dict:
         }
     }
     
-    # 실데이터 보강
+    # 🆕 Yahoo Finance 주식 지수 추가
+    if market_indices:
+        data["daily_snapshot"]["indices"] = market_indices
+    
+    # FRED 실데이터 보강 (환율, 금리)
     data = await enrich_with_fred(data)
     data = await enrich_with_ecos(data)
     
@@ -309,3 +369,4 @@ def build_analysis_prompt(data: dict) -> tuple[str, str]:
 한국어 마크다운으로 출력하되, 전문적이면서도 이해하기 쉽게 작성.
 """
     return system, user
+
